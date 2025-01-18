@@ -1,0 +1,227 @@
+pipeline {
+    agent any  
+
+    environment { 
+        AWS_ACCOUNT_ID = ''
+        AWS_DEFAULT_REGION = 'us-east-1'
+        IMAGE_REPO_NAME = 'auth-api'
+        GIT_REPO_NAME = "auth-api"
+        TAG = "${env.BUILD_ID}"
+        GIT_REPO_URL = "git.delbank.srv.br/Delbank-Labs/${GIT_REPO_NAME}.git"
+        IMAGE_NAME = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${IMAGE_REPO_NAME}"
+        APP_ENVIRONMENT = 'stg' 
+        ECS_CLUSTER_NAME = 'Delbank-STG'   
+        ECS_SERVICE_NAME = "${IMAGE_REPO_NAME}-${APP_ENVIRONMENT}" 
+        ECS_TASK_DEFINITION = "${IMAGE_REPO_NAME}-${APP_ENVIRONMENT}"
+    }
+         
+    triggers {
+        githubPush()
+    }
+
+    stages {
+
+        stage('Check Branch') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME != 'staging') {
+                        echo "Branch '${env.BRANCH_NAME}' não deve acionar build. Encerrando."
+                        currentBuild.result = 'SUCCESS'
+                        buildContinue = false
+                    } else {
+                        buildContinue = true
+                    }
+                    env.BUILD_CONTINUE = buildContinue.toString()
+                }
+            }
+        }
+
+        stage('Run Steps') {
+            when {
+                expression { return env.BUILD_CONTINUE == 'true' }
+            }
+            steps {
+                script {
+                    stage('Install AWS-CLI') {
+                        script {
+                            echo '---------------------Install AWS-CLI started!----------------------'
+                            sh '''
+                                curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                                unzip -o awscliv2.zip
+                                ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+                            '''
+                            echo '---------------------Install AWS-CLI finished!---------------------'
+                        }
+                    }
+
+                    stage('Logging into AWS') {
+                        script {
+                            echo '---------------------Logging into AWS started!---------------------'
+                            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-dio-cred']]) {
+                                sh """
+                                    aws configure set aws_access_key_id \$AWS_ACCESS_KEY_ID
+                                    aws configure set aws_secret_access_key \$AWS_SECRET_ACCESS_KEY
+                                    LOGIN_PASSWORD=\$(aws ecr get-login-password --region ${AWS_DEFAULT_REGION})
+                                    docker login -u AWS -p \$LOGIN_PASSWORD ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+                                """
+                            }
+                            echo '---------------------Logging into AWS finished!---------------------'
+                        }
+                    }
+
+                    stage('Loading .env') {
+                        script {
+                            echo '---------------------Loading environment variables started!---------------------'
+                            configFileProvider([configFile(fileId: '97a4c76a-c37e-48fb-8bb9-8b85589cb133', variable: 'auth_api_stg')]) {
+
+                                def lines = readFile("${auth_api_stg}").split("\n")
+                                def envVars = []
+                                lines.each { line ->
+                                    def parts = line.split("=")
+                                    if (parts.size() == 2) {
+                                        def key = parts[0].trim()
+                                        def value = parts[1].trim()
+                                        env."${key}" = value  
+                                        echo "Carregando: ${key} = ${value}"
+                                    }
+                                }
+                            }
+
+                            echo '-------------------------Environment variables loaded!-------------------------'
+                        }
+                    }
+
+                    stage('Create ECR Repository') {
+                        script {
+                            echo '---------------------Checking for ECR Repository...----------------------'
+                            def repoExists = sh(script: "aws ecr describe-repositories --repository-names ${IMAGE_REPO_NAME} --region ${AWS_DEFAULT_REGION} || echo 'not_found'", returnStdout: true).trim()
+                            if (repoExists == 'not_found') {
+                                echo '---------------------ECR Repository not found. Creating...----------------------'
+                                sh "aws ecr create-repository --repository-name ${IMAGE_REPO_NAME} --region ${AWS_DEFAULT_REGION}"
+                                echo '---------------------ECR Repository created successfully!---------------------'
+                            } else {
+                                echo '---------------------ECR Repository already exists!---------------------'
+                            }
+                        }
+                    }
+
+                    stage('Checkout') {
+                        withCredentials([usernamePassword(credentialsId: 'giteauth', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD')]) {
+                            echo '---------------------GitHub Checkout started!----------------------'
+                            sh 'rm -rf ${GIT_REPO_NAME}'
+                            sh 'git clone https://${GIT_USERNAME}:${GIT_PASSWORD}@${GIT_REPO_URL}'
+                            
+                            dir("${GIT_REPO_NAME}") {
+                                sh "git checkout ${env.BRANCH_NAME}"
+                            }
+                            echo '---------------------GitHub Checkout finished!---------------------'
+                        }
+                    }
+
+                    stage('Build Image') {
+                        script {
+                            echo '---------------------Docker build started!----------------------'
+                            app = docker.build("${IMAGE_NAME}:${APP_ENVIRONMENT}-${TAG}")
+                            echo '---------------------Docker build finished!---------------------'
+                        }
+                    }
+
+                      stage('Push Image') {
+                        script {
+                            echo '---------------------Docker push started!----------------------'
+                            def imageExists = sh(script: "docker images -q ${IMAGE_NAME}:latest", returnStdout: true).trim()
+                            if (imageExists) {
+                                echo "Removing image with tag 'latest'..."
+                                sh "docker rmi ${IMAGE_NAME}:latest"
+                            } else {
+                                echo "Image with tag 'latest' not found, skipping removal."
+                            }
+
+                            sh """
+                                docker tag ${IMAGE_NAME}:${APP_ENVIRONMENT}-${TAG} ${IMAGE_NAME}:latest
+                                docker push ${IMAGE_NAME}:${APP_ENVIRONMENT}-${TAG}
+                                docker push ${IMAGE_NAME}:latest
+                            """
+                            echo '---------------------Docker push finished!---------------------'
+                        }
+                    }
+
+                    stage('Register Task Definition') {
+                        script {
+                            echo '---------------------Registering new task definition...----------------------'
+                            def newTaskDefinition = sh(script: """
+                                aws ecs register-task-definition \
+                                    --family ${ECS_TASK_DEFINITION} \
+                                    --network-mode awsvpc \
+                                    --requires-compatibilities FARGATE \
+                                    --execution-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole \
+                                    --cpu "256" \
+                                    --memory "512" \
+                                    --container-definitions '[{
+                                        "name": "${ECS_TASK_DEFINITION}",
+                                        "image": "${IMAGE_NAME}:${APP_ENVIRONMENT}-${TAG}",
+                                        "essential": true,
+                                        "portMappings": [{
+                                            "containerPort": 3000,
+                                            "protocol": "tcp"
+                                        }],
+                                        "environment": [
+                                            { "name": "DB_HOST", "value": "${env.DB_HOST}" },
+                                            { "name": "DB_USERNAME", "value": "${env.DB_USERNAME}" },
+                                            { "name": "DB_PASSWORD", "value": "${env.DB_PASSWORD}" },
+                                            { "name": "DB_NAME", "value": "${env.DB_NAME}" },
+                                            { "name": "DB_PORT", "value": "${env.DB_PORT}" }
+                                                
+                                        ],
+                                "logConfiguration": {
+                                    "logDriver": "awslogs",
+                                    "options": {
+                                        "awslogs-group": "/ecs/${APP_ENVIRONMENT}/${IMAGE_REPO_NAME}",
+                                        "awslogs-region": "${AWS_DEFAULT_REGION}",
+                                        "awslogs-create-group": "true",
+                                        "awslogs-stream-prefix": "ecs"
+                                    }
+                                }
+                            }]'
+                            """, returnStdout: true).trim()
+                            echo 'Task definition registered successfully.'
+                        }
+                    }
+
+                    stage('Update ECS Service') {
+                        script {
+                            echo '---------------------Updating ECS service...----------------------'
+                            try {
+                                sh(script: """
+                                    aws ecs update-service \
+                                        --cluster ${ECS_CLUSTER_NAME} \
+                                        --service ${ECS_SERVICE_NAME} \
+                                        --task-definition ${ECS_TASK_DEFINITION} \
+                                        --force-new-deployment
+                                """)
+                                echo 'ECS service updated successfully.'
+                            } catch (Exception e) {
+                                echo "Error occurred during ECS service update: ${e.getMessage()}"
+                                error "Failed to update ECS service."
+                            }
+                        }
+                    }
+
+                    stage('Remove Image(s)') {
+                        echo '---------------------Removing Unused Image(s)...----------------------'
+                        sh "docker rmi ${IMAGE_NAME}:${APP_ENVIRONMENT}-${TAG}"
+                        echo '---------------------Unused Image(s) removed!-------------------------'
+                    }
+
+                    stage('Remove Origin Repository') {
+                        echo '---------------------Removing Origin Repository...--------------------'
+                        sh 'rm -rf ${GIT_REPO_NAME}'
+                        echo '---------------------Origin Repository removed!-------------------------'
+                    }
+                }
+            }
+        }
+    }
+}
+
+

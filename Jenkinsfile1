@@ -1,0 +1,35 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Início') {
+            steps {
+                echo 'Início da pipeline'
+            }
+        }
+
+        stage('Etapa 1') {
+            steps {
+                echo 'Executando Etapa 1'
+            }
+        }
+
+        stage('Etapa 2') {
+            steps {
+                echo 'Executando Etapa 2'
+            }
+        }
+
+        stage('Fim') {
+            steps {
+                echo 'Fim da pipeline'
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Esta etapa sempre será executada, independentemente do sucesso ou falha.'
+        }
+    }
+}
